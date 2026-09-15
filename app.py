@@ -1,27 +1,32 @@
 """
 Data Cleaning Studio
 --------------------
+
 A Streamlit data-cleaning application with:
 
 - CSV upload
+- Automatic dataset overview
 - Data preview
-- Duplicate removal
+- Duplicate detection/removal
 - Missing-value handling
 - Text cleaning
-- Numeric/datetime conversion
-- IQR outlier removal
-- Before/after statistics
+- Numeric conversion
+- Datetime conversion
+- IQR and Z-score outlier detection
 - Accurate audit logging
 - Undo
 - CSV export
 
-Run:
+Install:
     pip install streamlit pandas numpy
+
+Run:
     streamlit run app.py
 """
 
-from datetime import datetime
+import io
 import hashlib
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -29,7 +34,7 @@ import streamlit as st
 
 
 # ============================================================
-# PAGE CONFIG
+# PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -43,67 +48,35 @@ st.set_page_config(
 # SESSION STATE
 # ============================================================
 
-DEFAULT_STATE = {
-    "df": None,
-    "audit_log": [],
-    "history": [],
-    "file_id": None,
-    "file_name": None,
-}
+if "df" not in st.session_state:
+    st.session_state.df = None
 
-for key, value in DEFAULT_STATE.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
+if "audit_log" not in st.session_state:
+    st.session_state.audit_log = []
+
+if "history" not in st.session_state:
+    st.session_state.history = []
+
+if "file_id" not in st.session_state:
+    st.session_state.file_id = None
+
+if "file_name" not in st.session_state:
+    st.session_state.file_name = None
 
 
 # ============================================================
-# HELPERS
+# HELPER FUNCTIONS
 # ============================================================
 
-def timestamp():
+def get_timestamp():
+    """Return a readable timestamp."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def dataframe_hash(df):
-    """
-    Create a fingerprint of the dataframe so we can detect
-    whether the uploaded file is actually different.
-    """
-    try:
-        data = pd.util.hash_pandas_object(
-            df,
-            index=True,
-        ).values.tobytes()
-
-        return hashlib.md5(data).hexdigest()
-
-    except Exception:
-        return str(len(df))
-
-
-def log_action(
-    action,
-    rows_before,
-    rows_after,
-    cells_affected=0,
-    detail="",
-):
-    st.session_state.audit_log.append(
-        {
-            "timestamp": timestamp(),
-            "action": action,
-            "rows_before": rows_before,
-            "rows_after": rows_after,
-            "rows_removed": max(0, rows_before - rows_after),
-            "cells_affected": cells_affected,
-            "detail": detail,
-        }
-    )
 
 
 def save_history():
     """
-    Save a copy before modifying the dataframe.
+    Save the current dataframe before making a change.
+    This allows the user to undo the last operation.
     """
     if st.session_state.df is not None:
         st.session_state.history.append(
@@ -111,28 +84,11 @@ def save_history():
         )
 
 
-def undo():
-    """
-    Restore the previous dataframe.
-    """
-    if st.session_state.history:
-        st.session_state.df = st.session_state.history.pop()
-
-        log_action(
-            action="Undo",
-            rows_before=len(st.session_state.df),
-            rows_after=len(st.session_state.df),
-            detail="Restored previous dataframe state.",
-        )
-
-        st.rerun()
-
-
 def count_changed_cells(before, after):
     """
     Count cells whose values changed.
 
-    Handles NaN == NaN correctly.
+    NaN -> NaN is NOT considered a change.
     """
     if before.shape != after.shape:
         return 0
@@ -145,23 +101,69 @@ def count_changed_cells(before, after):
     return int(changed.sum().sum())
 
 
-def clean_text_preserve_missing(series, operation):
+def log_action(
+    action,
+    rows_before,
+    rows_after,
+    cells_affected=0,
+    detail="",
+):
+    """Add an action to the audit log."""
+
+    st.session_state.audit_log.append(
+        {
+            "timestamp": get_timestamp(),
+            "action": action,
+            "rows_before": rows_before,
+            "rows_after": rows_after,
+            "rows_removed": max(
+                0,
+                rows_before - rows_after
+            ),
+            "cells_affected": cells_affected,
+            "detail": detail,
+        }
+    )
+
+
+def clean_text(series, operation):
     """
-    Perform string operations without converting NaN into
-    the string 'nan'.
+    Apply text cleaning while preserving missing values.
+
+    This is important because:
+
+        astype(str)
+
+    would turn NaN into the string "nan".
     """
+
     result = series.copy()
 
     mask = result.notna()
 
     if operation == "Trim whitespace":
+
         result.loc[mask] = (
             result.loc[mask]
             .astype(str)
             .str.strip()
         )
 
+    elif operation == "Remove extra spaces":
+
+        result.loc[mask] = (
+            result.loc[mask]
+            .astype(str)
+            .str.replace(
+                r"\s+",
+                " ",
+                regex=True,
+            )
+            .str.strip()
+        )
+
     elif operation == "Lowercase text":
+
         result.loc[mask] = (
             result.loc[mask]
             .astype(str)
@@ -169,21 +171,37 @@ def clean_text_preserve_missing(series, operation):
         )
 
     elif operation == "Uppercase text":
+
         result.loc[mask] = (
             result.loc[mask]
             .astype(str)
             .str.upper()
         )
 
-    elif operation == "Remove extra spaces":
-        result.loc[mask] = (
-            result.loc[mask]
-            .astype(str)
-            .str.replace(r"\s+", " ", regex=True)
-            .str.strip()
-        )
-
     return result
+
+
+def undo_last_change():
+    """Restore the previous dataframe."""
+
+    if not st.session_state.history:
+        return
+
+    current_rows = len(st.session_state.df)
+
+    previous_df = st.session_state.history.pop()
+
+    st.session_state.df = previous_df
+
+    log_action(
+        action="Undo",
+        rows_before=current_rows,
+        rows_after=len(previous_df),
+        cells_affected=0,
+        detail="Restored the previous dataframe state.",
+    )
+
+    st.rerun()
 
 
 # ============================================================
@@ -193,8 +211,8 @@ def clean_text_preserve_missing(series, operation):
 st.title("🧹 Data Cleaning Studio")
 
 st.caption(
-    "Clean your data transparently, preview changes, "
-    "undo mistakes, and export a complete audit trail."
+    "Upload messy data, clean it transparently, "
+    "review every change, undo mistakes, and export the result."
 )
 
 
@@ -202,82 +220,115 @@ st.caption(
 # FILE UPLOAD
 # ============================================================
 
-uploaded = st.file_uploader(
+uploaded_file = st.file_uploader(
     "Upload a CSV file",
     type=["csv"],
 )
 
 
-if uploaded is not None:
+if uploaded_file is not None:
 
-    # Read uploaded file once
-    file_bytes = uploaded.getvalue()
+    # Read the raw file bytes.
+    file_bytes = uploaded_file.getvalue()
 
+    # Create a unique fingerprint for the uploaded file.
     file_id = hashlib.md5(file_bytes).hexdigest()
 
-    # Load only when a different file is uploaded
+    # Only reload when a NEW file is selected.
     if file_id != st.session_state.file_id:
 
         try:
-            new_df = pd.read_csv(io.BytesIO(file_bytes))
 
+            new_df = pd.read_csv(
+                io.BytesIO(file_bytes)
+            )
+
+            # Reset the application for the new file.
             st.session_state.df = new_df
             st.session_state.audit_log = []
             st.session_state.history = []
             st.session_state.file_id = file_id
-            st.session_state.file_name = uploaded.name
+            st.session_state.file_name = uploaded_file.name
 
             log_action(
                 action="Load data",
                 rows_before=0,
                 rows_after=len(new_df),
-                cells_affected=len(new_df) * len(new_df.columns),
-                detail=f"Loaded '{uploaded.name}'",
+                cells_affected=(
+                    len(new_df)
+                    * len(new_df.columns)
+                ),
+                detail=(
+                    f"Loaded '{uploaded_file.name}' "
+                    f"with {len(new_df):,} rows and "
+                    f"{len(new_df.columns):,} columns."
+                ),
             )
 
             st.rerun()
 
         except Exception as e:
-            st.error(f"Could not read the CSV file: {e}")
+
+            st.error(
+                f"Could not read the CSV file: {e}"
+            )
+
             st.stop()
 
 
 # ============================================================
-# NO DATA
+# WAITING FOR FILE
 # ============================================================
 
 if st.session_state.df is None:
-    st.info("Upload a CSV file to get started.")
+
+    st.info(
+        "👆 Upload a CSV file above to get started."
+    )
+
     st.stop()
 
+
+# ============================================================
+# CURRENT DATAFRAME
+# ============================================================
 
 df = st.session_state.df
 
 
 # ============================================================
-# FILE INFO
+# FILE INFORMATION
 # ============================================================
 
 st.success(
-    f"Loaded: **{st.session_state.file_name}**"
+    f"📁 Loaded file: **{st.session_state.file_name}**"
 )
 
 
 # ============================================================
-# DATASET METRICS
+# DATASET OVERVIEW
 # ============================================================
 
-st.subheader("Dataset overview")
+st.subheader("📊 Dataset overview")
 
-c1, c2, c3, c4 = st.columns(4)
+metric1, metric2, metric3, metric4 = st.columns(4)
 
-c1.metric("Rows", f"{len(df):,}")
-c2.metric("Columns", f"{len(df.columns):,}")
-c3.metric(
+metric1.metric(
+    "Rows",
+    f"{len(df):,}",
+)
+
+metric2.metric(
+    "Columns",
+    f"{len(df.columns):,}",
+)
+
+metric3.metric(
     "Missing cells",
     f"{int(df.isna().sum().sum()):,}",
 )
-c4.metric(
+
+metric4.metric(
     "Duplicate rows",
     f"{int(df.duplicated().sum()):,}",
 )
@@ -287,41 +338,52 @@ c4.metric(
 # DATA PREVIEW
 # ============================================================
 
-with st.expander("Preview data", expanded=True):
+st.subheader("👀 Data preview")
 
-    st.dataframe(
-        df.head(100),
-        use_container_width=True,
-        height=400,
-    )
+st.dataframe(
+    df.head(100),
+    use_container_width=True,
+    height=400,
+)
 
 
 # ============================================================
 # COLUMN INFORMATION
 # ============================================================
 
-with st.expander("Column information"):
+with st.expander("🔎 Column information"):
 
-    info_df = pd.DataFrame(
+    column_info = pd.DataFrame(
         {
             "Column": df.columns,
-            "Type": [
-                str(df[col].dtype)
-                for col in df.columns
+            "Data type": [
+                str(df[column].dtype)
+                for column in df.columns
             ],
             "Missing": [
-                int(df[col].isna().sum())
-                for col in df.columns
+                int(df[column].isna().sum())
+                for column in df.columns
             ],
-            "Unique": [
-                int(df[col].nunique(dropna=True))
-                for col in df.columns
+            "Missing %": [
+                round(
+                    df[column].isna().mean() * 100,
+                    2,
+                )
+                for column in df.columns
+            ],
+            "Unique values": [
+                int(
+                    df[column].nunique(
+                        dropna=True
+                    )
+                )
+                for column in df.columns
             ],
         }
     )
 
     st.dataframe(
-        info_df,
+        column_info,
         use_container_width=True,
         hide_index=True,
     )
@@ -331,7 +393,7 @@ with st.expander("Column information"):
 # CLEANING ACTIONS
 # ============================================================
 
-st.subheader("Cleaning actions")
+st.subheader("🛠️ Cleaning actions")
 
 tab_duplicates, tab_missing, tab_text, tab_outliers = st.tabs(
     [
@@ -349,30 +411,48 @@ tab_duplicates, tab_missing, tab_text, tab_outliers = st.tabs(
 
 with tab_duplicates:
 
-    duplicate_count = int(df.duplicated().sum())
-
-    st.write(
-        f"Found **{duplicate_count:,}** exact duplicate rows."
+    duplicate_count = int(
+        df.duplicated().sum()
     )
 
-    if duplicate_count > 0:
+    if duplicate_count == 0:
+
+        st.success(
+            "✅ No exact duplicate rows found."
+        )
+
+    else:
+
+        st.warning(
+            f"Found **{duplicate_count:,}** "
+            "duplicate rows."
+        )
+
+        st.caption(
+            "The first occurrence of each row will be kept."
+        )
 
         if st.button(
-            "Remove duplicate rows",
+            "🗑️ Remove duplicate rows",
             key="remove_duplicates",
+            use_container_width=True,
         ):
 
             before_df = df.copy()
 
             save_history()
 
-            df = df.drop_duplicates(
-                keep="first"
-            ).reset_index(drop=True)
+            df = (
+                df
+                .drop_duplicates(
+                    keep="first"
+                )
+                .reset_index(drop=True)
+            )
 
-            cells_changed = (
-                (len(before_df) - len(df))
-                * len(df.columns)
+            removed_rows = (
+                len(before_df)
+                - len(df)
             )
 
             st.session_state.df = df
@@ -381,17 +461,17 @@ with tab_duplicates:
                 action="Remove duplicates",
                 rows_before=len(before_df),
                 rows_after=len(df),
-                cells_affected=cells_changed,
+                cells_affected=(
+                    removed_rows
+                    * len(df.columns)
+                ),
                 detail=(
-                    f"Removed {len(before_df) - len(df)} "
-                    "duplicate rows; kept first occurrence."
+                    f"Removed {removed_rows:,} "
+                    "exact duplicate rows."
                 ),
             )
 
             st.rerun()
-
-    else:
-        st.success("No duplicate rows found.")
 
 
 # ============================================================
@@ -400,220 +480,344 @@ with tab_duplicates:
 
 with tab_missing:
 
-    col = st.selectbox(
-        "Column",
+    missing_column = st.selectbox(
+        "Choose a column",
         list(df.columns),
         key="missing_column",
     )
 
-    missing_count = int(df[col].isna().sum())
-
-    st.write(
-        f"Missing values in **{col}**: "
-        f"**{missing_count:,}**"
+    missing_count = int(
+        df[missing_column].isna().sum()
     )
 
-    strategy = st.selectbox(
-        "Strategy",
-        [
-            "Drop rows",
-            "Fill with mean",
-            "Fill with median",
-            "Fill with mode",
-            "Fill with custom value",
-        ],
-        key="missing_strategy",
-    )
+    if missing_count == 0:
 
-    custom_value = None
-
-    if strategy == "Fill with custom value":
-
-        custom_value = st.text_input(
-            "Custom value",
-            key="custom_missing_value",
+        st.success(
+            f"✅ '{missing_column}' has no missing values."
         )
 
-    if strategy in [
-        "Fill with mean",
-        "Fill with median",
-    ]:
+    else:
 
-        if not pd.api.types.is_numeric_dtype(
-            df[col]
+        st.warning(
+            f"'{missing_column}' contains "
+            f"**{missing_count:,}** missing values."
+        )
+
+        strategy = st.selectbox(
+            "How should missing values be handled?",
+            [
+                "Drop rows",
+                "Fill with mean",
+                "Fill with median",
+                "Fill with mode",
+                "Fill with custom value",
+            ],
+            key="missing_strategy",
+        )
+
+        custom_value = None
+
+        # ----------------------------------------
+        # Custom value
+        # ----------------------------------------
+
+        if strategy == "Fill with custom value":
+
+            custom_value = st.text_input(
+                "Enter the replacement value",
+                key="custom_missing_value",
+            )
+
+        # ----------------------------------------
+        # Validate mean / median
+        # ----------------------------------------
+
+        if strategy in [
+            "Fill with mean",
+            "Fill with median",
+        ]:
+
+            if not pd.api.types.is_numeric_dtype(
+                df[missing_column]
+            ):
+
+                st.error(
+                    "Mean and median can only be "
+                    "used with numeric columns."
+                )
+
+        # ----------------------------------------
+        # Preview
+        # ----------------------------------------
+
+        if strategy == "Fill with mean":
+
+            if pd.api.types.is_numeric_dtype(
+                df[missing_column]
+            ):
+
+                preview_value = (
+                    df[missing_column].mean()
+                )
+
+                st.info(
+                    f"Preview: missing values will "
+                    f"be replaced with "
+                    f"**{preview_value:.4g}**."
+                )
+
+        elif strategy == "Fill with median":
+
+            if pd.api.types.is_numeric_dtype(
+                df[missing_column]
+            ):
+
+                preview_value = (
+                    df[missing_column].median()
+                )
+
+                st.info(
+                    f"Preview: missing values will "
+                    f"be replaced with "
+                    f"**{preview_value:.4g}**."
+                )
+
+        elif strategy == "Fill with mode":
+
+            mode_values = df[
+                missing_column
+            ].mode(dropna=True)
+
+            if mode_values.empty:
+
+                st.error(
+                    "Cannot calculate the mode because "
+                    "there are no non-missing values."
+                )
+
+            else:
+
+                st.info(
+                    f"Preview: missing values will "
+                    f"be replaced with "
+                    f"**{mode_values.iloc[0]}**."
+                )
+
+        # ----------------------------------------
+        # Apply
+        # ----------------------------------------
+
+        if st.button(
+            "Apply missing-value cleaning",
+            key="apply_missing",
+            use_container_width=True,
         ):
-            st.warning(
-                "Mean and median can only be used "
-                "with numeric columns."
-            )
 
-    if strategy == "Fill with mode":
+            before_df = df.copy()
 
-        mode_values = df[col].mode(dropna=True)
+            save_history()
 
-        if mode_values.empty:
-            st.warning(
-                "There is no non-missing value available "
-                "to calculate the mode."
-            )
+            try:
 
-    if st.button(
-        "Apply missing-value cleaning",
-        key="apply_missing",
-    ):
+                # Drop rows
+                if strategy == "Drop rows":
 
-        if missing_count == 0:
-            st.info(
-                "This column has no missing values."
-            )
-            st.stop()
-
-        before_df = df.copy()
-        save_history()
-
-        try:
-
-            if strategy == "Drop rows":
-
-                df = df.dropna(
-                    subset=[col]
-                ).reset_index(drop=True)
-
-                detail = (
-                    f"Dropped rows where '{col}' "
-                    "was missing."
-                )
-
-            elif strategy == "Fill with mean":
-
-                if not pd.api.types.is_numeric_dtype(
-                    df[col]
-                ):
-                    raise ValueError(
-                        "Mean filling requires a numeric column."
+                    df = (
+                        df
+                        .dropna(
+                            subset=[
+                                missing_column
+                            ]
+                        )
+                        .reset_index(drop=True)
                     )
 
-                value = df[col].mean()
-
-                df[col] = df[col].fillna(value)
-
-                detail = (
-                    f"Filled {missing_count} missing values "
-                    f"with mean ({value:.4g})."
-                )
-
-            elif strategy == "Fill with median":
-
-                if not pd.api.types.is_numeric_dtype(
-                    df[col]
-                ):
-                    raise ValueError(
-                        "Median filling requires a numeric column."
+                    detail = (
+                        f"Dropped rows where "
+                        f"'{missing_column}' "
+                        "was missing."
                     )
 
-                value = df[col].median()
+                # Mean
+                elif strategy == "Fill with mean":
 
-                df[col] = df[col].fillna(value)
+                    if not pd.api.types.is_numeric_dtype(
+                        df[missing_column]
+                    ):
 
-                detail = (
-                    f"Filled {missing_count} missing values "
-                    f"with median ({value:.4g})."
-                )
-
-            elif strategy == "Fill with mode":
-
-                mode_values = df[col].mode(
-                    dropna=True
-                )
-
-                if mode_values.empty:
-                    raise ValueError(
-                        "Cannot calculate mode because "
-                        "the column contains no valid values."
-                    )
-
-                value = mode_values.iloc[0]
-
-                df[col] = df[col].fillna(value)
-
-                detail = (
-                    f"Filled {missing_count} missing values "
-                    f"with mode ({value})."
-                )
-
-            elif strategy == "Fill with custom value":
-
-                if custom_value == "":
-                    raise ValueError(
-                        "Enter a custom value."
-                    )
-
-                # Try to preserve numeric columns
-                if pd.api.types.is_numeric_dtype(
-                    df[col]
-                ):
-
-                    try:
-                        numeric_value = float(
-                            custom_value
+                        raise ValueError(
+                            "Mean filling requires "
+                            "a numeric column."
                         )
 
-                        if (
-                            pd.api.types.is_integer_dtype(
-                                df[col]
+                    value = (
+                        df[missing_column]
+                        .mean()
+                    )
+
+                    df[
+                        missing_column
+                    ] = df[
+                        missing_column
+                    ].fillna(value)
+
+                    detail = (
+                        f"Filled {missing_count:,} "
+                        f"missing values with "
+                        f"mean ({value:.4g})."
+                    )
+
+                # Median
+                elif strategy == "Fill with median":
+
+                    if not pd.api.types.is_numeric_dtype(
+                        df[missing_column]
+                    ):
+
+                        raise ValueError(
+                            "Median filling requires "
+                            "a numeric column."
+                        )
+
+                    value = (
+                        df[missing_column]
+                        .median()
+                    )
+
+                    df[
+                        missing_column
+                    ] = df[
+                        missing_column
+                    ].fillna(value)
+
+                    detail = (
+                        f"Filled {missing_count:,} "
+                        f"missing values with "
+                        f"median ({value:.4g})."
+                    )
+
+                # Mode
+                elif strategy == "Fill with mode":
+
+                    mode_values = df[
+                        missing_column
+                    ].mode(dropna=True)
+
+                    if mode_values.empty:
+
+                        raise ValueError(
+                            "Cannot calculate mode."
+                        )
+
+                    value = mode_values.iloc[0]
+
+                    df[
+                        missing_column
+                    ] = df[
+                        missing_column
+                    ].fillna(value)
+
+                    detail = (
+                        f"Filled {missing_count:,} "
+                        f"missing values with "
+                        f"mode ({value})."
+                    )
+
+                # Custom value
+                elif strategy == "Fill with custom value":
+
+                    if custom_value == "":
+
+                        raise ValueError(
+                            "Please enter a custom value."
+                        )
+
+                    # Preserve numeric types
+                    if pd.api.types.is_numeric_dtype(
+                        df[missing_column]
+                    ):
+
+                        try:
+
+                            numeric_value = float(
+                                custom_value
                             )
-                            and numeric_value.is_integer()
-                        ):
-                            numeric_value = int(
+
+                            if (
+                                pd.api.types
+                                .is_integer_dtype(
+                                    df[
+                                        missing_column
+                                    ]
+                                )
+                                and numeric_value.is_integer()
+                            ):
+
+                                numeric_value = int(
+                                    numeric_value
+                                )
+
+                            df[
+                                missing_column
+                            ] = df[
+                                missing_column
+                            ].fillna(
                                 numeric_value
                             )
 
-                        df[col] = df[col].fillna(
-                            numeric_value
+                        except ValueError:
+
+                            raise ValueError(
+                                "This is a numeric "
+                                "column. Please enter "
+                                "a numeric value."
+                            )
+
+                    else:
+
+                        df[
+                            missing_column
+                        ] = df[
+                            missing_column
+                        ].fillna(
+                            custom_value
                         )
 
-                    except ValueError:
-                        raise ValueError(
-                            "This is a numeric column. "
-                            "Enter a numeric custom value."
-                        )
-
-                else:
-                    df[col] = df[col].fillna(
-                        custom_value
+                    detail = (
+                        f"Filled {missing_count:,} "
+                        f"missing values with "
+                        f"'{custom_value}'."
                     )
 
-                detail = (
-                    f"Filled {missing_count} missing "
-                    f"values with '{custom_value}'."
+                cells_changed = count_changed_cells(
+                    before_df,
+                    df,
                 )
 
-            cells_changed = count_changed_cells(
-                before_df,
-                df,
-            )
+                st.session_state.df = df
 
-            st.session_state.df = df
+                log_action(
+                    action=(
+                        f"Missing values — "
+                        f"{missing_column}"
+                    ),
+                    rows_before=len(before_df),
+                    rows_after=len(df),
+                    cells_affected=cells_changed,
+                    detail=detail,
+                )
 
-            log_action(
-                action=f"Missing values — {col}",
-                rows_before=len(before_df),
-                rows_after=len(df),
-                cells_affected=cells_changed,
-                detail=detail,
-            )
+                st.rerun()
 
-            st.rerun()
+            except Exception as e:
 
-        except Exception as e:
+                # Remove failed history snapshot
+                if st.session_state.history:
+                    st.session_state.history.pop()
 
-            # Remove history snapshot if operation failed
-            if st.session_state.history:
-                st.session_state.history.pop()
-
-            st.error(
-                f"Could not apply operation: {e}"
-            )
+                st.error(
+                    f"Could not apply operation: {e}"
+                )
 
 
 # ============================================================
@@ -622,14 +826,14 @@ with tab_missing:
 
 with tab_text:
 
-    col = st.selectbox(
-        "Column",
+    transform_column = st.selectbox(
+        "Choose a column",
         list(df.columns),
         key="transform_column",
     )
 
-    action = st.selectbox(
-        "Action",
+    transform_action = st.selectbox(
+        "Choose an action",
         [
             "Trim whitespace",
             "Remove extra spaces",
@@ -641,99 +845,133 @@ with tab_text:
         key="transform_action",
     )
 
-    if action == "Convert to numeric":
+    # ----------------------------------------
+    # Warnings
+    # ----------------------------------------
 
-        st.caption(
-            "Values that cannot be converted will become missing."
+    if transform_action == "Convert to numeric":
+
+        st.info(
+            "Values that cannot be converted "
+            "to numbers will become missing (NaN)."
         )
 
-    if action == "Convert to datetime":
+    elif transform_action == "Convert to datetime":
 
-        st.caption(
-            "Values that cannot be interpreted as dates "
-            "will become missing."
+        st.info(
+            "Values that cannot be interpreted "
+            "as dates will become missing (NaT)."
         )
+
+    # ----------------------------------------
+    # Apply transformation
+    # ----------------------------------------
 
     if st.button(
         "Apply transformation",
         key="apply_transform",
+        use_container_width=True,
     ):
 
         before_df = df.copy()
+
         save_history()
 
         try:
 
-            if action in [
+            if transform_action in [
                 "Trim whitespace",
                 "Remove extra spaces",
                 "Lowercase text",
                 "Uppercase text",
             ]:
 
-                df[col] = clean_text_preserve_missing(
-                    df[col],
-                    action,
+                df[
+                    transform_column
+                ] = clean_text(
+                    df[
+                        transform_column
+                    ],
+                    transform_action,
                 )
 
                 detail = (
-                    f"Applied '{action}' to '{col}'."
+                    f"Applied '{transform_action}' "
+                    f"to '{transform_column}'."
                 )
 
-            elif action == "Convert to numeric":
+            elif transform_action == "Convert to numeric":
 
                 before_missing = int(
-                    df[col].isna().sum()
+                    df[
+                        transform_column
+                    ].isna().sum()
                 )
 
                 converted = pd.to_numeric(
-                    df[col],
+                    df[
+                        transform_column
+                    ],
                     errors="coerce",
                 )
 
-                new_missing = int(
+                after_missing = int(
                     converted.isna().sum()
                 )
 
-                df[col] = converted
-
                 newly_missing = max(
                     0,
-                    new_missing - before_missing,
+                    after_missing
+                    - before_missing,
                 )
+
+                df[
+                    transform_column
+                ] = converted
 
                 detail = (
-                    f"Converted '{col}' to numeric. "
-                    f"{newly_missing} values could not "
-                    "be converted and became missing."
+                    f"Converted '{transform_column}' "
+                    "to numeric. "
+                    f"{newly_missing:,} values "
+                    "could not be converted and "
+                    "became missing."
                 )
 
-            elif action == "Convert to datetime":
+            elif transform_action == "Convert to datetime":
 
                 before_missing = int(
-                    df[col].isna().sum()
+                    df[
+                        transform_column
+                    ].isna().sum()
                 )
 
                 converted = pd.to_datetime(
-                    df[col],
+                    df[
+                        transform_column
+                    ],
                     errors="coerce",
                 )
 
-                new_missing = int(
+                after_missing = int(
                     converted.isna().sum()
                 )
 
-                df[col] = converted
-
                 newly_missing = max(
                     0,
-                    new_missing - before_missing,
+                    after_missing
+                    - before_missing,
                 )
 
+                df[
+                    transform_column
+                ] = converted
+
                 detail = (
-                    f"Converted '{col}' to datetime. "
-                    f"{newly_missing} values could not "
-                    "be converted and became missing."
+                    f"Converted '{transform_column}' "
+                    "to datetime. "
+                    f"{newly_missing:,} values "
+                    "could not be converted and "
+                    "became missing."
                 )
 
             cells_changed = count_changed_cells(
@@ -744,7 +982,10 @@ with tab_text:
             st.session_state.df = df
 
             log_action(
-                action=f"Transform — {col}",
+                action=(
+                    f"Transform — "
+                    f"{transform_column}"
+                ),
                 rows_before=len(before_df),
                 rows_after=len(df),
                 cells_affected=cells_changed,
@@ -769,11 +1010,16 @@ with tab_text:
 
 with tab_outliers:
 
-    numeric_cols = df.select_dtypes(
-        include=np.number
-    ).columns.tolist()
+    numeric_columns = (
+        df
+        .select_dtypes(
+            include=np.number
+        )
+        .columns
+        .tolist()
+    )
 
-    if not numeric_cols:
+    if not numeric_columns:
 
         st.info(
             "No numeric columns are available "
@@ -782,13 +1028,13 @@ with tab_outliers:
 
     else:
 
-        col = st.selectbox(
-            "Numeric column",
-            numeric_cols,
+        outlier_column = st.selectbox(
+            "Choose a numeric column",
+            numeric_columns,
             key="outlier_column",
         )
 
-        method = st.selectbox(
+        detection_method = st.selectbox(
             "Detection method",
             [
                 "IQR",
@@ -797,54 +1043,83 @@ with tab_outliers:
             key="outlier_method",
         )
 
-        if method == "IQR":
+        # ----------------------------------------
+        # IQR
+        # ----------------------------------------
+
+        if detection_method == "IQR":
 
             multiplier = st.slider(
                 "IQR multiplier",
-                1.0,
-                3.0,
-                1.5,
-                0.25,
+                min_value=1.0,
+                max_value=3.0,
+                value=1.5,
+                step=0.25,
+                key="iqr_multiplier",
             )
+
+        # ----------------------------------------
+        # Z-score
+        # ----------------------------------------
 
         else:
 
             z_threshold = st.slider(
                 "Z-score threshold",
-                1.5,
-                5.0,
-                3.0,
-                0.5,
+                min_value=1.5,
+                max_value=5.0,
+                value=3.0,
+                step=0.5,
+                key="z_threshold",
             )
 
-        series = df[col].dropna()
+        series = df[
+            outlier_column
+        ].dropna()
 
         if len(series) == 0:
 
             st.warning(
-                "This column contains no numeric values."
+                "This column contains no valid "
+                "numeric values."
             )
 
         else:
 
-            if method == "IQR":
+            # ----------------------------------------
+            # Calculate outliers
+            # ----------------------------------------
+
+            if detection_method == "IQR":
 
                 q1 = series.quantile(0.25)
                 q3 = series.quantile(0.75)
 
                 iqr = q3 - q1
 
-                lower = q1 - multiplier * iqr
-                upper = q3 + multiplier * iqr
+                lower_bound = (
+                    q1
+                    - multiplier * iqr
+                )
+
+                upper_bound = (
+                    q3
+                    + multiplier * iqr
+                )
 
                 outlier_mask = (
-                    (df[col] < lower)
-                    | (df[col] > upper)
+                    (df[outlier_column] < lower_bound)
+                    | (
+                        df[outlier_column]
+                        > upper_bound
+                    )
                 )
 
                 description = (
-                    f"Values below {lower:.4g} "
-                    f"or above {upper:.4g}"
+                    f"Values below "
+                    f"{lower_bound:.4g} "
+                    f"or above "
+                    f"{upper_bound:.4g}."
                 )
 
             else:
@@ -860,61 +1135,106 @@ with tab_outliers:
                     )
 
                     description = (
-                        "Standard deviation is zero; "
-                        "no outliers detected."
+                        "Standard deviation is zero. "
+                        "No outliers detected."
                     )
 
                 else:
 
                     z_scores = (
-                        (df[col] - mean)
+                        (
+                            df[outlier_column]
+                            - mean
+                        )
                         / std
                     ).abs()
 
                     outlier_mask = (
-                        z_scores > z_threshold
+                        z_scores
+                        > z_threshold
                     )
 
                     description = (
-                        f"|z| > {z_threshold}"
+                        f"Values with "
+                        f"|z| > {z_threshold}."
                     )
+
+            # ----------------------------------------
+            # Show result
+            # ----------------------------------------
 
             outlier_count = int(
                 outlier_mask.sum()
             )
 
-            st.write(
-                f"Potential outliers: "
-                f"**{outlier_count:,}**"
-            )
+            if outlier_count == 0:
 
-            st.caption(description)
+                st.success(
+                    "✅ No outliers detected."
+                )
 
-            if outlier_count > 0:
+            else:
+
+                st.warning(
+                    f"Found **{outlier_count:,}** "
+                    "potential outliers."
+                )
+
+                st.caption(
+                    description
+                )
+
+                # Show potential outliers
+                with st.expander(
+                    "Preview detected outliers"
+                ):
+
+                    st.dataframe(
+                        df.loc[
+                            outlier_mask
+                        ].head(100),
+                        use_container_width=True,
+                    )
 
                 if st.button(
-                    "Remove outliers",
+                    "🗑️ Remove outliers",
                     key="remove_outliers",
+                    use_container_width=True,
                 ):
 
                     before_df = df.copy()
+
                     save_history()
 
-                    df = df.loc[
-                        ~outlier_mask
-                    ].reset_index(drop=True)
+                    df = (
+                        df.loc[
+                            ~outlier_mask
+                        ]
+                        .reset_index(drop=True)
+                    )
+
+                    removed_rows = (
+                        len(before_df)
+                        - len(df)
+                    )
 
                     st.session_state.df = df
 
                     log_action(
-                        action=f"Remove outliers — {col}",
+                        action=(
+                            f"Remove outliers — "
+                            f"{outlier_column}"
+                        ),
                         rows_before=len(before_df),
                         rows_after=len(df),
                         cells_affected=(
-                            (len(before_df) - len(df))
+                            removed_rows
                             * len(df.columns)
                         ),
-                        detail=description,
+                        detail=(
+                            f"{detection_method}: "
+                            f"{description}"
+                        ),
                     )
 
                     st.rerun()
@@ -926,77 +1246,103 @@ with tab_outliers:
 
 st.divider()
 
-undo_col, spacer = st.columns([1, 5])
+st.subheader("↩️ Undo")
 
-with undo_col:
+if st.session_state.history:
 
-    if st.session_state.history:
+    st.write(
+        f"{len(st.session_state.history)} "
+        "previous version(s) available."
+    )
 
-        if st.button(
-            "↩️ Undo last change",
-            key="undo",
-        ):
-            undo()
+    if st.button(
+        "↩️ Undo last change",
+        use_container_width=True,
+    ):
+
+        undo_last_change()
+
+else:
+
+    st.caption(
+        "No changes available to undo."
+    )
 
 
 # ============================================================
 # AUDIT LOG
 # ============================================================
 
+st.divider()
+
 st.subheader("📋 Audit log")
 
 if st.session_state.audit_log:
 
-    log_df = pd.DataFrame(
+    audit_df = pd.DataFrame(
         st.session_state.audit_log
     )
 
     st.dataframe(
-        log_df,
+        audit_df,
         use_container_width=True,
         hide_index=True,
     )
 
 else:
 
-    st.caption("No actions recorded yet.")
+    st.caption(
+        "No actions recorded yet."
+    )
 
 
 # ============================================================
 # EXPORT
 # ============================================================
 
-st.subheader("Export")
+st.subheader("📦 Export")
 
-c1, c2 = st.columns(2)
+export_col1, export_col2 = st.columns(2)
 
-with c1:
+
+with export_col1:
+
+    cleaned_csv = df.to_csv(
+        index=False
+    ).encode("utf-8")
 
     st.download_button(
         "⬇️ Download cleaned data",
-        data=df.to_csv(
-            index=False
-        ).encode("utf-8"),
+        data=cleaned_csv,
         file_name="cleaned_data.csv",
         mime="text/csv",
         use_container_width=True,
     )
 
 
-with c2:
+with export_col2:
 
     if st.session_state.audit_log:
 
-        log_csv = pd.DataFrame(
+        audit_csv = pd.DataFrame(
             st.session_state.audit_log
-        ).to_csv(index=False)
+        ).to_csv(
+            index=False
+        ).encode("utf-8")
 
         st.download_button(
             "⬇️ Download audit log",
-            data=log_csv.encode("utf-8"),
+            data=audit_csv,
             file_name="audit_log.csv",
             mime="text/csv",
             use_container_width=True,
+        )
+
+    else:
+
+        st.caption(
+            "Audit log will appear here after "
+            "cleaning actions are performed."
         )
 
 
@@ -1008,7 +1354,7 @@ st.divider()
 
 if st.button(
     "🔄 Start over",
-    key="start_over",
+    use_container_width=True,
 ):
 
     st.session_state.df = None
